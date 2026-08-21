@@ -1,0 +1,260 @@
+        # Every requested decision rank must cover all leaves exactly once.
+        for rank in RANKS:
+            nodes = self.rank_nodes[rank]
+            cover = self.leaf_mask[nodes].sum(axis=0)
+            if not np.all(cover == 1.0):
+                raise AssertionError(f"rank {rank} does not partition selected leaves: {cover}")
+
+    def masses(self, probs: np.ndarray) -> np.ndarray:
+        return np.asarray(probs, dtype=np.float64) @ self.leaf_mask.T
+
+    def path(self, node_index: int) -> List[int]:
+        return self.path_cache[node_index]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "nodes": [dataclasses.asdict(n) for n in self.nodes],
+            "leaf_nodes": self.leaf_nodes,
+            "class_names": self.class_names,
+            "internal_nodes": self.internal_nodes,
+        }
+
+
+@dataclass
+class UtilityState:
+    rank: str
+    actions: np.ndarray
+    scores: np.ndarray
+    outcomes: np.ndarray
+    residuals: np.ndarray
+    node_residuals: np.ndarray
+    masses: np.ndarray
+    decomposition_error: float
+
+
+def compute_utility_state(probs: np.ndarray, labels: np.ndarray, tree: TaxonomyTree, rank: str) -> UtilityState:
+    probs = ensure_probabilities(probs)
+    labels = np.asarray(labels, dtype=np.int64)
+    masses = tree.masses(probs)
+    candidates = np.asarray(tree.rank_nodes[rank], dtype=np.int64)
+    local = np.argmax(masses[:, candidates], axis=1)
+    actions = candidates[local]
+    scores = masses[np.arange(len(probs)), actions]
+    outcomes = tree.leaf_mask[actions, labels]
+    residuals = outcomes - scores
+    node_residuals = np.zeros((len(probs), len(tree.internal_nodes)), dtype=np.float64)
+
+    for action in np.unique(actions):
+        sample_indices = np.flatnonzero(actions == action)
+        action_mass = masses[sample_indices, action]
+        path = tree.path(int(action))
+        for parent, child in zip(path[:-1], path[1:]):
+            if parent not in tree.internal_position:
+                raise AssertionError("a non-internal node appeared as a path parent")
+            parent_mass = masses[sample_indices, parent]
+            child_mass = masses[sample_indices, child]
+            if np.any(child_mass <= 0) or np.any(parent_mass <= 0):
+                raise AssertionError("selected action path has zero mass")
+            q = child_mass / parent_mass
+            multiplier = action_mass / child_mass
+            indicator_child = tree.leaf_mask[child, labels[sample_indices]]
+            indicator_parent = tree.leaf_mask[parent, labels[sample_indices]]
+            contribution = multiplier * (indicator_child - q * indicator_parent)
+            node_residuals[sample_indices, tree.internal_position[parent]] = contribution
+
+    error = float(np.max(np.abs(residuals - node_residuals.sum(axis=1))))
+    if error > 5e-10:
+        raise AssertionError(f"utility decomposition failed for {rank}: {error}")
+    return UtilityState(rank, actions, scores, outcomes, residuals, node_residuals, masses, error)
+
+
+def rule_direction(state: UtilityState, tree: TaxonomyTree, node_index: Optional[int]) -> Tuple[np.ndarray, np.ndarray]:
+    n = len(state.actions)
+    k = tree.num_leaves
+    direction = np.zeros((n, k), dtype=np.float64)
+    active = np.zeros(n, dtype=bool)
+    if node_index is None:
+        for action in np.unique(state.actions):
+            rows = np.flatnonzero(state.actions == action)
+            direction[rows] = tree.leaf_mask[action]
+            active[rows] = True
+        return direction, active
+
+    for action in np.unique(state.actions):
+        path = tree.path(int(action))
+        if node_index not in path[:-1]:
+            continue
+        j = path.index(node_index)
+        child = path[j + 1]
+        rows = np.flatnonzero(state.actions == action)
+        parent_mass = state.masses[rows, node_index]
+        child_mass = state.masses[rows, child]
+        action_mass = state.masses[rows, action]
+        q = child_mass / parent_mass
+        multiplier = action_mass / child_mass
+        direction[rows] = multiplier[:, None] * (
+            tree.leaf_mask[child][None, :] - q[:, None] * tree.leaf_mask[node_index][None, :]
+        )
+        active[rows] = True
+    return direction, active
+
+
+@dataclass
+class IntervalResult:
+    score: float
+    signed_moment: float
+    lower: float
+    upper: float
+    support: int
+    column: int
+
+
+def exact_worst_intervals(scores: np.ndarray, residual_matrix: np.ndarray, support_mask: np.ndarray, normalizer: int) -> List[IntervalResult]:
+    scores = np.asarray(scores, dtype=np.float64)
+    residual_matrix = np.asarray(residual_matrix, dtype=np.float64)
+    if residual_matrix.ndim == 1:
+        residual_matrix = residual_matrix[:, None]
+    support_mask = np.asarray(support_mask, dtype=bool)
+    if not np.any(support_mask):
+        return [IntervalResult(0.0, 0.0, 0.0, 0.0, 0, j) for j in range(residual_matrix.shape[1])]
+    indices = np.flatnonzero(support_mask)
+    order = np.argsort(scores[indices], kind="mergesort")
+    indices = indices[order]
+    sorted_scores = scores[indices]
+    sorted_residuals = residual_matrix[indices]
+    unique_scores, first = np.unique(sorted_scores, return_index=True)
+    block_residuals = np.add.reduceat(sorted_residuals, first, axis=0)
+    block_counts = np.diff(np.append(first, len(sorted_scores)))
+    results: List[IntervalResult] = []
+
+    for column in range(block_residuals.shape[1]):
+        values = block_residuals[:, column]
+        best_abs = -1.0
+        best_signed = 0.0
+        best_l = 0
+        best_r = 0
+        # Maximum-sum contiguous interval.
+        current = 0.0
+        start = 0
+        for i, value in enumerate(values):
+            if current + value < value:
+                current = float(value)
+                start = i
+            else:
+                current += float(value)
+            candidate_abs = abs(current)
+            if candidate_abs > best_abs + 1e-15:
+                best_abs, best_signed, best_l, best_r = candidate_abs, current, start, i
+        # Minimum-sum contiguous interval, needed because the largest absolute sum may be negative.
+        current = 0.0
+        start = 0
+        for i, value in enumerate(values):
+            if current + value > value:
+                current = float(value)
+                start = i
+            else:
+                current += float(value)
+            candidate_abs = abs(current)
+            if candidate_abs > best_abs + 1e-15:
+                best_abs, best_signed, best_l, best_r = candidate_abs, current, start, i
+        support = int(block_counts[best_l:best_r + 1].sum())
+        results.append(IntervalResult(
+            score=float(best_abs / normalizer),
+            signed_moment=float(best_signed / normalizer),
+            lower=float(unique_scores[best_l]),
+            upper=float(unique_scores[best_r]),
+            support=support,
+            column=column,
+        ))
+    return results
+
+
+def brute_force_interval(scores: np.ndarray, residuals: np.ndarray, support: np.ndarray, normalizer: int) -> IntervalResult:
+    unique = np.unique(scores[support])
+    best = IntervalResult(-1.0, 0.0, 0.0, 0.0, 0, 0)
+    for i, lower in enumerate(unique):
+        for upper in unique[i:]:
+            mask = support & (scores >= lower) & (scores <= upper)
+            signed = float(np.sum(residuals[mask]) / normalizer)
+            if abs(signed) > best.score + 1e-15:
+                best = IntervalResult(abs(signed), signed, float(lower), float(upper), int(mask.sum()), 0)
+    return best
+
+
+@dataclass
+class GroupSpec:
+    brightness_median: float
+    contrast_median: float
+
+
+def make_group_spec(train_stats: Mapping[str, np.ndarray]) -> GroupSpec:
+    return GroupSpec(
+        brightness_median=float(np.median(train_stats["brightness"])),
+        contrast_median=float(np.median(train_stats["contrast"])),
+    )
+
+
+def group_masks(stats: Mapping[str, np.ndarray], spec: GroupSpec) -> Dict[str, np.ndarray]:
+    brightness = np.asarray(stats["brightness"], dtype=np.float64)
+    contrast = np.asarray(stats["contrast"], dtype=np.float64)
+    aspect = np.asarray(stats["aspect"], dtype=np.float64)
+    return {
+        "all": np.ones(len(brightness), dtype=bool),
+        "dark": brightness <= spec.brightness_median,
+        "bright": brightness > spec.brightness_median,
+        "low_contrast": contrast <= spec.contrast_median,
+        "high_contrast": contrast > spec.contrast_median,
+        "portrait": aspect < 1.0,
+        "landscape": aspect >= 1.0,
+    }
+
+
+@dataclass
+class Candidate:
+    score: float
+    signed_moment: float
+    utility_rank: str
+    group: str
+    lower: float
+    upper: float
+    support: int
+    node_index: Optional[int]
+
+
+@dataclass
+class Rule:
+    utility_rank: str
+    group: str
+    lower: float
+    upper: float
+    node_index: Optional[int]
+    sign: float
+    step: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+def candidate_sort_key(candidate: Candidate) -> Tuple[float, int, str, int, float, float]:
+    utility_order = {r: i for i, r in enumerate(RANKS)}
+    return (
+        -candidate.score,
+        utility_order[candidate.utility_rank],
+        candidate.group,
+        -1 if candidate.node_index is None else candidate.node_index,
+        candidate.lower,
+        candidate.upper,
+    )
+
+
+def find_candidate(
+    method: str,
+    probs: np.ndarray,
+    labels: np.ndarray,
+    groups: Mapping[str, np.ndarray],
+    tree: TaxonomyTree,
+) -> Tuple[Candidate, Dict[str, UtilityState]]:
+    states = {rank: compute_utility_state(probs, labels, tree, rank) for rank in RANKS}
+    candidates: List[Candidate] = []
+    selected_groups = ["all"] if method == "UC" else list(groups.keys())
+    for rank in RANKS:
