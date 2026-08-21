@@ -38,6 +38,7 @@ jobs:
           python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
       - name: Assemble and verify experiment program
         run: |
+          set -euo pipefail
           cat experiments/inat_compositions/parts/part_*.txt > experiments/inat_compositions/run_inat_composition.py
           python -m py_compile experiments/inat_compositions/run_inat_composition.py
           python experiments/inat_compositions/run_inat_composition.py --output outputs/self_test --self-test-only
@@ -45,6 +46,7 @@ jobs:
         id: experiment
         continue-on-error: true
         run: |
+          set -euo pipefail
           mkdir -p outputs/inat_compositions
           python experiments/inat_compositions/run_inat_composition.py \
             --output outputs/inat_compositions \
