@@ -1,0 +1,260 @@
+    logp = np.log(np.maximum(probs, 1e-300))
+    # Full multinomial map on log probabilities. C=0.1 matches the prior pilot configuration.
+    model = LogisticRegression(
+        C=0.1,
+        penalty="l2",
+        solver="lbfgs",
+        max_iter=1500,
+        tol=1e-8,
+        random_state=seed,
+    )
+    model.fit(logp, labels)
+    return DirichletState(model=model, num_classes=probs.shape[1])
+
+
+def complete_probabilities(model: Any, x: np.ndarray, num_classes: int) -> np.ndarray:
+    q = model.predict_proba(x)
+    result = np.full((len(q), num_classes), 1e-15, dtype=np.float64)
+    result[:, np.asarray(model.classes_, dtype=np.int64)] = q
+    return ensure_probabilities(result)
+
+
+def build_base_model(name: str, seed: int) -> Any:
+    if name == "LR":
+        return Pipeline([
+            ("scale", StandardScaler()),
+            ("model", LogisticRegression(C=1.0, max_iter=1500, tol=1e-7, solver="lbfgs", random_state=seed)),
+        ])
+    if name == "GNB":
+        return GaussianNB(var_smoothing=1e-9)
+    if name == "DT":
+        return DecisionTreeClassifier(min_samples_leaf=2, random_state=seed)
+    if name == "RF":
+        return RandomForestClassifier(n_estimators=250, min_samples_leaf=1, n_jobs=2, random_state=seed)
+    if name == "XGB":
+        try:
+            from xgboost import XGBClassifier
+        except Exception as exc:
+            raise RuntimeError("xgboost is required for the XGB base learner") from exc
+        return XGBClassifier(
+            n_estimators=180,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            objective="multi:softprob",
+            eval_metric="mlogloss",
+            n_jobs=2,
+            random_state=seed,
+            reg_lambda=1.0,
+        )
+    if name == "MLP":
+        return Pipeline([
+            ("scale", StandardScaler()),
+            ("model", MLPClassifier(
+                hidden_layer_sizes=(256,),
+                alpha=1e-4,
+                batch_size=128,
+                learning_rate_init=1e-3,
+                early_stopping=True,
+                validation_fraction=0.15,
+                n_iter_no_change=15,
+                max_iter=350,
+                random_state=seed,
+            )),
+        ])
+    raise ValueError(name)
+
+
+def split_indices(labels: np.ndarray, seed: int) -> Dict[str, np.ndarray]:
+    labels = np.asarray(labels, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    parts: Dict[str, List[int]] = {k: [] for k in ("train", "stage1", "stage2", "validation", "test")}
+    for label in np.unique(labels):
+        indices = np.flatnonzero(labels == label)
+        rng.shuffle(indices)
+        n = len(indices)
+        # The acquisition target is 100/class. This also works if a cached run has a different count.
+        counts = {
+            "train": int(math.floor(0.45 * n)),
+            "stage1": int(math.floor(0.15 * n)),
+            "stage2": int(math.floor(0.15 * n)),
+            "validation": int(math.floor(0.10 * n)),
+        }
+        used = sum(counts.values())
+        counts["test"] = n - used
+        if min(counts.values()) < 5:
+            raise RuntimeError(f"class {label} has too few examples for five-way split: n={n}, counts={counts}")
+        offset = 0
+        for key in ("train", "stage1", "stage2", "validation", "test"):
+            count = counts[key]
+            parts[key].extend(indices[offset:offset + count].tolist())
+            offset += count
+    return {key: np.asarray(sorted(value), dtype=np.int64) for key, value in parts.items()}
+
+
+def exact_mc(probs: np.ndarray, labels: np.ndarray) -> float:
+    n, k = probs.shape
+    best = 0.0
+    for class_index in range(k):
+        residual = (labels == class_index).astype(np.float64) - probs[:, class_index]
+        interval = exact_worst_intervals(
+            probs[:, class_index], residual[:, None], np.ones(n, dtype=bool), normalizer=n
+        )[0]
+        best = max(best, interval.score)
+    return float(best)
+
+
+def evaluate_all(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    groups: Mapping[str, np.ndarray],
+    tree: TaxonomyTree,
+) -> Dict[str, float]:
+    probs = ensure_probabilities(probs)
+    labels = np.asarray(labels, dtype=np.int64)
+    n = len(labels)
+    uc = 0.0
+    c_uc = 0.0
+    huc = 0.0
+    c_huc = 0.0
+    max_decomp = 0.0
+    rank_errors: Dict[str, float] = {}
+    for rank in RANKS:
+        state = compute_utility_state(probs, labels, tree, rank)
+        max_decomp = max(max_decomp, state.decomposition_error)
+        rank_errors[f"{rank}_error"] = float(1.0 - np.mean(state.outcomes))
+        for group_name, group in groups.items():
+            total_result = exact_worst_intervals(
+                state.scores, state.residuals[:, None], group, normalizer=n
+            )[0]
+            node_results = exact_worst_intervals(
+                state.scores, state.node_residuals, group, normalizer=n
+            )
+            node_score = max(x.score for x in node_results)
+            c_uc = max(c_uc, total_result.score)
+            c_huc = max(c_huc, node_score)
+            if group_name == "all":
+                uc = max(uc, total_result.score)
+                huc = max(huc, node_score)
+    result: Dict[str, float] = {
+        "MC": exact_mc(probs, labels),
+        "UC": float(uc),
+        "C-UC": float(c_uc),
+        "HUC": float(huc),
+        "C-HUC": float(c_huc),
+        "Brier": multiclass_brier(probs, labels),
+        "NLL": multiclass_nll(probs, labels),
+        "Accuracy": float(np.mean(np.argmax(probs, axis=1) == labels)),
+        "AUC": macro_auc(probs, labels),
+        "decomposition_error": max_decomp,
+        "probability_sum_error": float(np.max(np.abs(probs.sum(axis=1) - 1.0))),
+        "minimum_probability": float(np.min(probs)),
+    }
+    result.update(rank_errors)
+    return result
+
+
+def summarize_results(frame: pd.DataFrame) -> pd.DataFrame:
+    metric_columns = [
+        "MC", "UC", "C-UC", "HUC", "C-HUC", "Brier", "NLL", "Accuracy", "AUC",
+        "class_error", "order_error", "family_error", "genus_error", "species_error",
+    ]
+    rows: List[Dict[str, Any]] = []
+    method_order = list(dict.fromkeys(frame["method"].tolist()))
+    for method in method_order:
+        part = frame[frame["method"] == method]
+        row: Dict[str, Any] = {"method": method, "n": len(part)}
+        for metric in metric_columns:
+            row[f"{metric}_mean"] = float(part[metric].mean())
+            row[f"{metric}_std"] = float(part[metric].std(ddof=1))
+            row[f"{metric}_display"] = f"{row[f'{metric}_mean']:.6f} ± {row[f'{metric}_std']:.6f}"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def paired_comparisons(frame: pd.DataFrame) -> pd.DataFrame:
+    pairs = [
+        ("Raw", "Temperature"),
+        ("Raw", "Dirichlet"),
+        ("Raw", "Raw→UC"),
+        ("Raw", "Raw→C-HUC"),
+        ("Temperature", "Temperature→UC"),
+        ("Temperature", "Temperature→C-HUC"),
+        ("Dirichlet", "Dirichlet→UC"),
+        ("Dirichlet", "Dirichlet→C-HUC"),
+        ("Raw→UC", "Temperature→UC"),
+        ("Raw→UC", "Dirichlet→UC"),
+        ("Raw→C-HUC", "Temperature→C-HUC"),
+        ("Raw→C-HUC", "Dirichlet→C-HUC"),
+        ("Temperature→UC", "Temperature→C-HUC"),
+        ("Dirichlet→UC", "Dirichlet→C-HUC"),
+    ]
+    metrics = ["MC", "UC", "C-UC", "HUC", "C-HUC", "Brier", "NLL", "Accuracy", "AUC"]
+    index_columns = ["seed", "base_model"]
+    indexed = frame.set_index(index_columns + ["method"])
+    rows: List[Dict[str, Any]] = []
+    for reference, target in pairs:
+        for metric in metrics:
+            reference_series = indexed.xs(reference, level="method")[metric]
+            target_series = indexed.xs(target, level="method")[metric]
+            common = reference_series.index.intersection(target_series.index)
+            ref = reference_series.loc[common].to_numpy(dtype=float)
+            tar = target_series.loc[common].to_numpy(dtype=float)
+            delta = tar - ref
+            if metric in LOWER_IS_BETTER:
+                wins = int(np.sum(delta < -1e-12))
+                losses = int(np.sum(delta > 1e-12))
+            else:
+                wins = int(np.sum(delta > 1e-12))
+                losses = int(np.sum(delta < -1e-12))
+            ties = len(delta) - wins - losses
+            denom = float(np.mean(np.abs(ref)))
+            rows.append({
+                "reference": reference,
+                "target": target,
+                "metric": metric,
+                "n": len(delta),
+                "reference_mean": float(np.mean(ref)),
+                "target_mean": float(np.mean(tar)),
+                "mean_delta_target_minus_reference": float(np.mean(delta)),
+                "relative_change": float(np.mean(delta) / denom) if denom > 0 else float("nan"),
+                "wins": wins,
+                "ties": ties,
+                "losses": losses,
+            })
+    return pd.DataFrame(rows)
+
+
+def run_self_test() -> Dict[str, Any]:
+    taxonomy = []
+    leaves = [
+        ("Animalia", "Chordata", "Amphibia", "Anura", "Ranidae", "Lithobates", "Lithobates a"),
+        ("Animalia", "Chordata", "Amphibia", "Anura", "Ranidae", "Lithobates", "Lithobates b"),
+        ("Fungi", "Basidiomycota", "Agaricomycetes", "Agaricales", "Amanitaceae", "Amanita", "Amanita a"),
+        ("Fungi", "Basidiomycota", "Agaricomycetes", "Agaricales", "Amanitaceae", "Amanita", "Amanita b"),
+    ]
+    for names in leaves:
+        taxonomy.append([
+            {"rank": rank, "name": name, "id": i}
+            for i, (rank, name) in enumerate(zip(TAXONOMIC_RANK_ORDER, names), start=1)
+        ])
+    tree = TaxonomyTree(taxonomy)
+    rng = np.random.default_rng(4)
+    p = rng.dirichlet(np.ones(4), size=80)
+    y = rng.integers(0, 4, size=80)
+    for rank in RANKS:
+        state = compute_utility_state(p, y, tree, rank)
+        if state.decomposition_error > 1e-10:
+            raise AssertionError(state.decomposition_error)
+    scores = np.array([0.1, 0.1, 0.2, 0.3, 0.3, 0.4])
+    residual = np.array([0.2, -0.1, -0.4, 0.5, -0.1, 0.2])
+    support = np.ones(len(scores), dtype=bool)
+    exact = exact_worst_intervals(scores, residual[:, None], support, len(scores))[0]
+    brute = brute_force_interval(scores, residual, support, len(scores))
+    if abs(exact.score - brute.score) > 1e-12:
+        raise AssertionError((exact, brute))
+    projected = project_simplex_rows(rng.normal(size=(100, 11)))
+    if np.max(np.abs(projected.sum(axis=1) - 1)) > 1e-12 or np.min(projected) < -1e-12:
+        raise AssertionError("projection self-test failed")
+    stats = {"brightness": rng.random(80), "contrast": rng.random(80), "aspect": rng.uniform(0.5, 1.5, 80)}
