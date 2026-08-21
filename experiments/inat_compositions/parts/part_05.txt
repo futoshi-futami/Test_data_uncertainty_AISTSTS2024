@@ -1,0 +1,260 @@
+    spec = make_group_spec(stats)
+    groups = group_masks(stats, spec)
+    rules, history = fit_booster("UC", p[:40], y[:40], p[40:], y[40:], {k: v[:40] for k, v in groups.items()}, {k: v[40:] for k, v in groups.items()}, tree, max_rounds=3, patience=2)
+    return {
+        "tree_nodes": tree.num_nodes,
+        "max_decomposition_error": max(compute_utility_state(p, y, tree, r).decomposition_error for r in RANKS),
+        "interval_score": exact.score,
+        "projection_error": float(np.max(np.abs(projected.sum(axis=1) - 1))),
+        "booster_rules": len(rules),
+        "history_rows": len(history),
+    }
+
+
+def run_experiment(args: argparse.Namespace) -> None:
+    root = args.output.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "STATUS.json").write_text(json.dumps({"status": "running", "started_at": time.time()}, indent=2), encoding="utf-8")
+
+    self_test = run_self_test()
+    (root / "SELF_TEST.json").write_text(json.dumps(self_test, indent=2), encoding="utf-8")
+    print("Self-test passed", self_test, flush=True)
+
+    manifest, taxonomy_paths = acquire_real_images(root, args.images_per_species)
+    feature_data = extract_resnet18_features(root, manifest)
+    features = feature_data["features"].astype(np.float64)
+    labels = feature_data["labels"].astype(np.int64)
+    all_stats = {
+        "brightness": feature_data["brightness"].astype(np.float64),
+        "contrast": feature_data["contrast"].astype(np.float64),
+        "aspect": feature_data["aspect"].astype(np.float64),
+    }
+    tree = TaxonomyTree(taxonomy_paths)
+    (root / "data" / "taxonomy_tree.json").write_text(json.dumps(tree.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    methods = [
+        "Raw",
+        "Temperature",
+        "Dirichlet",
+        "Raw→UC",
+        "Raw→C-HUC",
+        "Temperature→UC",
+        "Temperature→C-HUC",
+        "Dirichlet→UC",
+        "Dirichlet→C-HUC",
+    ]
+    base_models = ["LR", "GNB", "DT", "RF", "XGB", "MLP"]
+    rows: List[Dict[str, Any]] = []
+    parameter_rows: List[Dict[str, Any]] = []
+    total_start = time.time()
+
+    for seed in args.seeds:
+        split = split_indices(labels, seed)
+        split_manifest_rows = []
+        for split_name, indices in split.items():
+            for idx in indices:
+                split_manifest_rows.append({
+                    "seed": seed,
+                    "split": split_name,
+                    "row_index": int(idx),
+                    "class_index": int(labels[idx]),
+                    "scientific_name": str(manifest.loc[idx, "scientific_name"]),
+                    "observation_id": int(manifest.loc[idx, "observation_id"]),
+                })
+        pd.DataFrame(split_manifest_rows).to_csv(root / f"split_seed_{seed}.csv", index=False)
+
+        train_stats = {name: values[split["train"]] for name, values in all_stats.items()}
+        group_spec = make_group_spec(train_stats)
+        group_sets = {
+            split_name: group_masks({name: values[indices] for name, values in all_stats.items()}, group_spec)
+            for split_name, indices in split.items()
+        }
+        for base_name in base_models:
+            cell_start = time.time()
+            print(f"Seed {seed} base {base_name}", flush=True)
+            model = build_base_model(base_name, seed)
+            model.fit(features[split["train"]], labels[split["train"]])
+            base_probs = {
+                split_name: complete_probabilities(model, features[indices], tree.num_leaves)
+                for split_name, indices in split.items()
+            }
+            y = {split_name: labels[indices] for split_name, indices in split.items()}
+
+            temperature = fit_temperature(base_probs["stage1"], y["stage1"])
+            temperature_probs = {
+                split_name: transform_temperature(base_probs[split_name], temperature)
+                for split_name in ("stage2", "validation", "test")
+            }
+            dirichlet_state = fit_dirichlet(base_probs["stage1"], y["stage1"], seed)
+            dirichlet_probs = {
+                split_name: dirichlet_state.apply(base_probs[split_name])
+                for split_name in ("stage2", "validation", "test")
+            }
+
+            probability_outputs: Dict[str, np.ndarray] = {
+                "Raw": base_probs["test"],
+                "Temperature": temperature_probs["test"],
+                "Dirichlet": dirichlet_probs["test"],
+            }
+            parameter_rows.extend([
+                {"seed": seed, "base_model": base_name, "method": "Temperature", "temperature": temperature},
+                {"seed": seed, "base_model": base_name, "method": "Dirichlet", "C": 0.1},
+            ])
+
+            starts = {
+                "Raw": {
+                    "stage2": base_probs["stage2"],
+                    "validation": base_probs["validation"],
+                    "test": base_probs["test"],
+                },
+                "Temperature": temperature_probs,
+                "Dirichlet": dirichlet_probs,
+            }
+            history_dir = root / "histories" / f"seed_{seed}" / base_name
+            history_dir.mkdir(parents=True, exist_ok=True)
+            for start_name, start_probs in starts.items():
+                for second_method in ("UC", "C-HUC"):
+                    composed_name = f"{start_name}→{second_method}"
+                    fit_start = time.time()
+                    rules, history = fit_booster(
+                        second_method,
+                        start_probs["stage2"], y["stage2"],
+                        start_probs["validation"], y["validation"],
+                        group_sets["stage2"], group_sets["validation"], tree,
+                        max_rounds=args.max_rounds, patience=args.patience, epsilon=1e-8,
+                    )
+                    probability_outputs[composed_name] = apply_rules(
+                        start_probs["test"], group_sets["test"], tree, rules
+                    )
+                    history.to_csv(history_dir / f"{composed_name.replace('→', '_to_')}.csv", index=False)
+                    (history_dir / f"{composed_name.replace('→', '_to_')}_rules.json").write_text(
+                        json.dumps([r.to_dict() for r in rules], ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                    parameter_rows.append({
+                        "seed": seed,
+                        "base_model": base_name,
+                        "method": composed_name,
+                        "n_rules": len(rules),
+                        "fit_seconds": time.time() - fit_start,
+                        "best_validation_objective": float(history.attrs.get("best_validation_objective", np.nan)),
+                        "initial_validation_objective": float(history.attrs.get("initial_validation_objective", np.nan)),
+                    })
+                    print(f"  {composed_name}: rules={len(rules)}", flush=True)
+
+            if set(probability_outputs) != set(methods):
+                raise AssertionError((set(probability_outputs), set(methods)))
+            for method in methods:
+                metrics = evaluate_all(
+                    probability_outputs[method], y["test"], group_sets["test"], tree
+                )
+                rows.append({
+                    "seed": seed,
+                    "base_model": base_name,
+                    "method": method,
+                    "n_train": len(split["train"]),
+                    "n_stage1": len(split["stage1"]),
+                    "n_stage2": len(split["stage2"]),
+                    "n_validation": len(split["validation"]),
+                    "n_test": len(split["test"]),
+                    **metrics,
+                })
+            pd.DataFrame(rows).to_csv(root / "results_all.csv", index=False)
+            pd.DataFrame(parameter_rows).to_csv(root / "parameters_all.csv", index=False)
+            print(f"Completed seed {seed} base {base_name} in {time.time() - cell_start:.1f}s", flush=True)
+
+    frame = pd.DataFrame(rows)
+    summary = summarize_results(frame)
+    comparisons = paired_comparisons(frame)
+    by_base = (
+        frame.groupby(["base_model", "method"])[
+            ["MC", "UC", "C-UC", "HUC", "C-HUC", "Brier", "NLL", "Accuracy", "AUC", "species_error"]
+        ]
+        .agg(["mean", "std"])
+        .reset_index()
+    )
+    by_base.columns = ["_".join(x).rstrip("_") for x in by_base.columns.to_flat_index()]
+
+    summary.to_csv(root / "summary.csv", index=False)
+    comparisons.to_csv(root / "paired_comparisons.csv", index=False)
+    by_base.to_csv(root / "summary_by_base_model.csv", index=False)
+
+    validation = {
+        "status": "success",
+        "n_rows": len(frame),
+        "expected_rows": len(args.seeds) * len(base_models) * len(methods),
+        "n_seeds": len(args.seeds),
+        "n_base_models": len(base_models),
+        "n_methods": len(methods),
+        "images": len(manifest),
+        "species": tree.num_leaves,
+        "tree_nodes": tree.num_nodes,
+        "tree_internal_nodes": len(tree.internal_nodes),
+        "maximum_decomposition_error": float(frame["decomposition_error"].max()),
+        "maximum_probability_sum_error": float(frame["probability_sum_error"].max()),
+        "minimum_probability": float(frame["minimum_probability"].min()),
+        "total_seconds": time.time() - total_start,
+        "data_source": "public iNaturalist API research-grade observations; fresh real-image rerun",
+        "method_design": "separate 45/15/15/10/15 train/stage1/stage2/validation/test split per species",
+        "projected_methods": "exact tie-preserving closed intervals; exact Euclidean simplex projection; projected-Brier Armijo step 0.5/0.7/1e-4; validation prefix",
+    }
+    if validation["n_rows"] != validation["expected_rows"]:
+        raise AssertionError(validation)
+    if validation["maximum_decomposition_error"] > 5e-9:
+        raise AssertionError(validation)
+    if validation["maximum_probability_sum_error"] > 5e-10:
+        raise AssertionError(validation)
+    (root / "VALIDATION.json").write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    report_lines = [
+        "# iNaturalist real-image postprocessing composition experiment\n",
+        "\n",
+        "This is a fresh real-image rerun obtained from public research-grade iNaturalist observations. ",
+        "It is not the earlier official iNaturalist-19 30-species split. The selected taxonomic design retains ",
+        "12 Amanita, 10 Lithobates, and 8 Enallagma species.\n\n",
+        "## Design\n\n",
+        f"- images: {len(manifest)} ({args.images_per_species} per species)\n",
+        f"- seeds: {args.seeds}\n",
+        "- base models: LR, GNB, DT, RF, XGB, MLP\n",
+        "- per-species split: 45% train, 15% first-stage calibration, 15% UC/C-HUC, 10% validation, 15% test\n",
+        "- compared: Raw; Temperature; Dirichlet; Raw/Temperature/Dirichlet followed by UC or C-HUC\n\n",
+        "## Summary\n\n",
+        summary[["method"] + [f"{m}_display" for m in ["MC", "UC", "C-UC", "HUC", "C-HUC", "Brier", "NLL", "Accuracy", "AUC"]]].to_markdown(index=False),
+        "\n\n## Selected paired effects\n\n",
+        comparisons[comparisons["metric"].isin(["UC", "C-HUC", "Brier", "NLL", "Accuracy", "AUC"])].to_markdown(index=False),
+        "\n",
+    ]
+    (root / "REPORT.md").write_text("".join(report_lines), encoding="utf-8")
+
+    # The raw images are not included in the artifact. The reproducible manifest and frozen features are retained.
+    shutil.rmtree(root / "data" / "images", ignore_errors=True)
+    (root / "STATUS.json").write_text(json.dumps({"status": "success", **validation}, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("Experiment completed", json.dumps(validation, indent=2), flush=True)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--images-per-species", type=int, default=100)
+    parser.add_argument("--seeds", type=int, nargs="+", default=[20260819, 20260820, 20260821, 20260822, 20260823])
+    parser.add_argument("--max-rounds", type=int, default=100)
+    parser.add_argument("--patience", type=int, default=12)
+    parser.add_argument("--self-test-only", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.self_test_only:
+        print(json.dumps(run_self_test(), indent=2))
+        return
+    try:
+        run_experiment(args)
+    except Exception as exc:
+        args.output.mkdir(parents=True, exist_ok=True)
+        (args.output / "STATUS.json").write_text(json.dumps({
+            "status": "failed",
+            "error": repr(exc),
+            "traceback": traceback.format_exc(),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        raise
+
