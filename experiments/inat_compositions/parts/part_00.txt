@@ -1,0 +1,260 @@
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import math
+import os
+import random
+import shutil
+import sys
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+from PIL import Image, ImageFile
+from scipy.optimize import minimize_scalar
+from sklearn.base import clone
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.naive_bayes import GaussianNB
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+GENUS_TARGETS: Tuple[Tuple[str, int], ...] = (
+    ("Amanita", 12),
+    ("Lithobates", 10),
+    ("Enallagma", 8),
+)
+RANKS: Tuple[str, ...] = ("class", "order", "family", "genus", "species")
+TAXONOMIC_RANK_ORDER: Tuple[str, ...] = (
+    "kingdom", "phylum", "class", "order", "family", "genus", "species"
+)
+LOWER_IS_BETTER = {
+    "MC", "UC", "C-UC", "HUC", "C-HUC", "Brier", "NLL",
+    "class_error", "order_error", "family_error", "genus_error", "species_error",
+}
+
+
+def stable_softmax(logits: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits, dtype=np.float64)
+    logits = logits - np.max(logits, axis=1, keepdims=True)
+    ex = np.exp(logits)
+    return ex / np.sum(ex, axis=1, keepdims=True)
+
+
+def ensure_probabilities(probs: np.ndarray) -> np.ndarray:
+    probs = np.asarray(probs, dtype=np.float64)
+    if probs.ndim != 2:
+        raise ValueError(f"probabilities must be 2D, got {probs.shape}")
+    if not np.all(np.isfinite(probs)):
+        raise ValueError("probabilities contain non-finite values")
+    probs = np.maximum(probs, 0.0)
+    sums = probs.sum(axis=1, keepdims=True)
+    if np.any(sums <= 0):
+        raise ValueError("probability row has non-positive sum")
+    return probs / sums
+
+
+def project_simplex_rows(values: np.ndarray) -> np.ndarray:
+    z = np.asarray(values, dtype=np.float64)
+    one = z.ndim == 1
+    if one:
+        z = z[None, :]
+    if z.ndim != 2 or z.shape[1] == 0:
+        raise ValueError("simplex projection expects a nonempty vector or matrix")
+    if not np.all(np.isfinite(z)):
+        raise ValueError("simplex projection received a non-finite value")
+    u = np.sort(z, axis=1)[:, ::-1]
+    cssv = np.cumsum(u, axis=1) - 1.0
+    ind = np.arange(1, z.shape[1] + 1, dtype=np.float64)[None, :]
+    cond = u - cssv / ind > 0.0
+    rho = cond.sum(axis=1) - 1
+    theta = cssv[np.arange(len(z)), rho] / (rho + 1.0)
+    w = np.maximum(z - theta[:, None], 0.0)
+    # Remove only floating point row-sum drift, not by clipping/renormalization.
+    if np.max(np.abs(w.sum(axis=1) - 1.0)) > 2e-12:
+        raise AssertionError("simplex projection row sums failed")
+    return w[0] if one else w
+
+
+def multiclass_brier(probs: np.ndarray, labels: np.ndarray) -> float:
+    probs = ensure_probabilities(probs)
+    labels = np.asarray(labels, dtype=np.int64)
+    rows = np.arange(len(labels))
+    return float(np.mean(np.sum(probs * probs, axis=1) - 2.0 * probs[rows, labels] + 1.0))
+
+
+def multiclass_nll(probs: np.ndarray, labels: np.ndarray) -> float:
+    probs = ensure_probabilities(probs)
+    labels = np.asarray(labels, dtype=np.int64)
+    return float(-np.mean(np.log(np.maximum(probs[np.arange(len(labels)), labels], 1e-300))))
+
+
+def macro_auc(probs: np.ndarray, labels: np.ndarray) -> float:
+    try:
+        y_onehot = np.eye(probs.shape[1], dtype=np.float64)[labels]
+        return float(roc_auc_score(y_onehot, probs, average="macro", multi_class="ovr"))
+    except Exception:
+        return float("nan")
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+class INatAPI:
+    def __init__(self, cache_dir: Path, timeout: int = 60) -> None:
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "HUC-composition-experiment/1.0 (research reproducibility)",
+            "Accept": "application/json",
+        })
+
+    def get(self, endpoint: str, params: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        params = dict(params or {})
+        key = hashlib.sha256((endpoint + "?" + json.dumps(params, sort_keys=True)).encode()).hexdigest()
+        cache_path = self.cache_dir / f"{key}.json"
+        if cache_path.exists():
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        url = "https://api.inaturalist.org/v1/" + endpoint.lstrip("/")
+        last: Optional[Exception] = None
+        for attempt in range(8):
+            try:
+                response = self.session.get(url, params=params, timeout=self.timeout)
+                if response.status_code == 429:
+                    time.sleep(min(60, 2 ** attempt))
+                    continue
+                response.raise_for_status()
+                obj = response.json()
+                cache_path.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+                time.sleep(0.15)
+                return obj
+            except Exception as exc:
+                last = exc
+                time.sleep(min(30, 1.5 ** attempt))
+        raise RuntimeError(f"iNaturalist API failed for {url} {params}: {last}")
+
+    def exact_genus(self, name: str) -> Dict[str, Any]:
+        obj = self.get("taxa/autocomplete", {"q": name, "rank": "genus", "per_page": 30})
+        candidates = [x for x in obj.get("results", []) if x.get("rank") == "genus"]
+        exact = [x for x in candidates if str(x.get("name", "")).lower() == name.lower()]
+        if not exact:
+            raise RuntimeError(f"could not find exact genus {name}: {[x.get('name') for x in candidates[:10]]}")
+        return exact[0]
+
+    def species_children(self, genus: Mapping[str, Any], count: int, minimum_observations: int) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        page = 1
+        while page <= 10 and len(candidates) < count * 4:
+            obj = self.get("taxa", {
+                "parent_id": int(genus["id"]),
+                "rank": "species",
+                "per_page": 200,
+                "page": page,
+                "order_by": "observations_count",
+                "order": "desc",
+            })
+            rows = obj.get("results", [])
+            if not rows:
+                break
+            for taxon in rows:
+                if taxon.get("rank") != "species" or not taxon.get("is_active", True):
+                    continue
+                if int(taxon.get("observations_count") or 0) < minimum_observations:
+                    continue
+                name = str(taxon.get("name", ""))
+                if " × " in name or " x " in name.lower() or len(name.split()) != 2:
+                    continue
+                candidates.append(taxon)
+            page += 1
+        # Deterministic order: observation count descending, then scientific name.
+        candidates.sort(key=lambda x: (-int(x.get("observations_count") or 0), str(x.get("name"))))
+        if len(candidates) < count:
+            raise RuntimeError(f"only {len(candidates)} eligible species under {genus['name']}, need {count}")
+        return candidates[:count]
+
+    def taxon_detail(self, taxon_id: int) -> Dict[str, Any]:
+        obj = self.get(f"taxa/{taxon_id}")
+        rows = obj.get("results", [])
+        if not rows:
+            raise RuntimeError(f"missing taxon detail {taxon_id}")
+        return rows[0]
+
+    def observation_candidates(self, species_id: int, target: int) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        seen_photo_ids: set[int] = set()
+        page = 1
+        while page <= 20 and len(candidates) < target:
+            obj = self.get("observations", {
+                "taxon_id": species_id,
+                "quality_grade": "research",
+                "photos": "true",
+                "captive": "false",
+                "verifiable": "true",
+                "per_page": 200,
+                "page": page,
+                "order_by": "id",
+                "order": "asc",
+            })
+            rows = obj.get("results", [])
+            if not rows:
+                break
+            for obs in rows:
+                photos = obs.get("photos") or []
+                if not photos:
+                    continue
+                taxon = obs.get("taxon") or {}
+                ancestor_ids = set(int(x) for x in (taxon.get("ancestor_ids") or []))
+                if int(taxon.get("id") or -1) != species_id and species_id not in ancestor_ids:
+                    continue
+                photo = photos[0]
+                photo_id = int(photo.get("id") or 0)
+                if photo_id <= 0 or photo_id in seen_photo_ids:
+                    continue
+                url = str(photo.get("url") or "")
+                if not url:
+                    continue
+                for size in ("square", "thumb", "small", "medium", "large", "original"):
+                    url = url.replace(f"/{size}.", "/small.")
+                seen_photo_ids.add(photo_id)
+                candidates.append({
+                    "observation_id": int(obs["id"]),
+                    "photo_id": photo_id,
+                    "photo_url": url,
+                    "photo_license": photo.get("license_code"),
+                    "observed_on": obs.get("observed_on"),
+                    "place_guess": obs.get("place_guess"),
+                })
+                if len(candidates) >= target:
+                    break
+            page += 1
+        return candidates
+
+
+def normalized_taxonomy_path(detail: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    rows = list(detail.get("ancestors") or []) + [dict(detail)]
+    rank_to_taxon: Dict[str, Dict[str, Any]] = {}
+    for taxon in rows:
+        rank = str(taxon.get("rank", ""))
+        if rank in TAXONOMIC_RANK_ORDER:
+            rank_to_taxon[rank] = {
