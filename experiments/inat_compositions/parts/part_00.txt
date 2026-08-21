@@ -163,31 +163,41 @@ class INatAPI:
         return exact[0]
 
     def species_children(self, genus: Mapping[str, Any], count: int, minimum_observations: int) -> List[Dict[str, Any]]:
-        candidates: List[Dict[str, Any]] = []
+        # The taxa search endpoint is not a reliable way to enumerate an entire
+        # descendant subtree. The species-count endpoint returns observed species
+        # below the genus and their research-grade observation counts directly.
+        candidates_by_id: Dict[int, Dict[str, Any]] = {}
         page = 1
-        while page <= 10 and len(candidates) < count * 4:
-            obj = self.get("taxa", {
-                "parent_id": int(genus["id"]),
-                "rank": "species",
+        while page <= 10:
+            obj = self.get("observations/species_counts", {
+                "taxon_id": int(genus["id"]),
+                "quality_grade": "research",
+                "photos": "true",
+                "captive": "false",
+                "verifiable": "true",
                 "per_page": 200,
                 "page": page,
-                "order_by": "observations_count",
-                "order": "desc",
             })
             rows = obj.get("results", [])
             if not rows:
                 break
-            for taxon in rows:
+            for row in rows:
+                taxon = dict(row.get("taxon") or {})
                 if taxon.get("rank") != "species" or not taxon.get("is_active", True):
                     continue
-                if int(taxon.get("observations_count") or 0) < minimum_observations:
+                observed_count = int(row.get("count") or taxon.get("observations_count") or 0)
+                if observed_count < minimum_observations:
                     continue
                 name = str(taxon.get("name", ""))
                 if " × " in name or " x " in name.lower() or len(name.split()) != 2:
                     continue
-                candidates.append(taxon)
+                taxon["observations_count"] = observed_count
+                candidates_by_id[int(taxon["id"])] = taxon
+            if len(rows) < 200:
+                break
             page += 1
-        # Deterministic order: observation count descending, then scientific name.
+        candidates = list(candidates_by_id.values())
+        # Deterministic order: observed research-grade count descending, then name.
         candidates.sort(key=lambda x: (-int(x.get("observations_count") or 0), str(x.get("name"))))
         if len(candidates) < count:
             raise RuntimeError(f"only {len(candidates)} eligible species under {genus['name']}, need {count}")
