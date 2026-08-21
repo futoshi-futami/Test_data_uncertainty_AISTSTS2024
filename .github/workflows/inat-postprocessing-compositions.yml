@@ -6,6 +6,11 @@ on:
     paths:
       - "experiments/inat_compositions/**"
       - ".github/workflows/inat-postprocessing-compositions.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "experiments/inat_compositions/**"
+      - ".github/workflows/inat-postprocessing-compositions.yml"
 
 permissions:
   contents: read
