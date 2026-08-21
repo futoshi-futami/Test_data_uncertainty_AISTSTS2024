@@ -1,0 +1,68 @@
+name: iNaturalist postprocessing compositions
+
+on:
+  push:
+    branches: ["agent/inat-postprocessing-compositions"]
+    paths:
+      - "experiments/inat_compositions/**"
+      - ".github/workflows/inat-postprocessing-compositions.yml"
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  OMP_NUM_THREADS: "2"
+  MKL_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "2"
+  NUMEXPR_NUM_THREADS: "2"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CPU dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas scipy scikit-learn pillow requests xgboost tabulate matplotlib openpyxl
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      - name: Assemble and verify experiment program
+        run: |
+          cat experiments/inat_compositions/parts/part_*.txt > experiments/inat_compositions/run_inat_composition.py
+          python -m py_compile experiments/inat_compositions/run_inat_composition.py
+          python experiments/inat_compositions/run_inat_composition.py --output outputs/self_test --self-test-only
+      - name: Run real-image factorial comparison
+        id: experiment
+        continue-on-error: true
+        run: |
+          mkdir -p outputs/inat_compositions
+          python experiments/inat_compositions/run_inat_composition.py \
+            --output outputs/inat_compositions \
+            --images-per-species 100 \
+            --seeds 20260819 20260820 20260821 20260822 20260823 \
+            --max-rounds 100 \
+            --patience 12 \
+            2>&1 | tee outputs/inat_compositions/console.log
+      - name: Package outputs
+        if: always()
+        run: |
+          tar -czf inat_postprocessing_compositions.tar.gz outputs
+          ls -lh inat_postprocessing_compositions.tar.gz
+          cat outputs/inat_compositions/STATUS.json || true
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inat-postprocessing-compositions
+          path: |
+            inat_postprocessing_compositions.tar.gz
+            outputs
+          retention-days: 30
+      - name: Fail if experiment failed
+        if: steps.experiment.outcome != 'success'
+        run: exit 1
