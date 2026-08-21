@@ -1,0 +1,260 @@
+        state = states[rank]
+        if method == "UC":
+            residual_matrix = state.residuals[:, None]
+            node_ids: List[Optional[int]] = [None]
+        elif method == "C-HUC":
+            residual_matrix = state.node_residuals
+            node_ids = list(tree.internal_nodes)
+        else:
+            raise ValueError(method)
+        for group in selected_groups:
+            interval_results = exact_worst_intervals(
+                state.scores, residual_matrix, groups[group], normalizer=len(labels)
+            )
+            for result, node_id in zip(interval_results, node_ids):
+                if result.support <= 0:
+                    continue
+                candidates.append(Candidate(
+                    score=result.score,
+                    signed_moment=result.signed_moment,
+                    utility_rank=rank,
+                    group=group,
+                    lower=result.lower,
+                    upper=result.upper,
+                    support=result.support,
+                    node_index=node_id,
+                ))
+    if not candidates:
+        raise RuntimeError("no candidate cell")
+    candidates.sort(key=candidate_sort_key)
+    return candidates[0], states
+
+
+def rule_cell(state: UtilityState, groups: Mapping[str, np.ndarray], rule: Rule, active: np.ndarray) -> np.ndarray:
+    # The audited cell is defined by group and score interval. Samples for which
+    # the selected node is not on the action path have a zero direction and zero
+    # node contribution, but remain members of the same audited cell.
+    return (
+        groups[rule.group]
+        & (state.scores >= rule.lower)
+        & (state.scores <= rule.upper)
+    )
+
+
+def apply_rule(
+    probs: np.ndarray,
+    groups: Mapping[str, np.ndarray],
+    tree: TaxonomyTree,
+    rule: Rule,
+) -> np.ndarray:
+    current = ensure_probabilities(probs)
+    placeholder = np.zeros(len(current), dtype=np.int64)
+    state = compute_utility_state(current, placeholder, tree, rule.utility_rank)
+    direction, active = rule_direction(state, tree, rule.node_index)
+    cell = rule_cell(state, groups, rule, active)
+    proposed = current.copy()
+    update_cell = cell & active
+    if np.any(update_cell):
+        proposed[update_cell] = project_simplex_rows(
+            current[update_cell] + rule.step * rule.sign * direction[update_cell]
+        )
+    return ensure_probabilities(proposed)
+
+
+def apply_rules(
+    probs: np.ndarray,
+    groups: Mapping[str, np.ndarray],
+    tree: TaxonomyTree,
+    rules: Sequence[Rule],
+) -> np.ndarray:
+    current = ensure_probabilities(probs)
+    for rule in rules:
+        current = apply_rule(current, groups, tree, rule)
+    return current
+
+
+def evaluate_target(method: str, probs: np.ndarray, labels: np.ndarray, groups: Mapping[str, np.ndarray], tree: TaxonomyTree) -> float:
+    candidate, _ = find_candidate(method, probs, labels, groups, tree)
+    return candidate.score
+
+
+def armijo_update(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    groups: Mapping[str, np.ndarray],
+    tree: TaxonomyTree,
+    candidate: Candidate,
+    initial_step: float = 0.5,
+    shrink: float = 0.7,
+    c1: float = 1e-4,
+    max_backtracks: int = 100,
+) -> Tuple[Optional[np.ndarray], Optional[Rule], Dict[str, Any]]:
+    state = compute_utility_state(probs, labels, tree, candidate.utility_rank)
+    direction, active = rule_direction(state, tree, candidate.node_index)
+    sign = 1.0 if candidate.signed_moment >= 0.0 else -1.0
+    proto = Rule(candidate.utility_rank, candidate.group, candidate.lower, candidate.upper, candidate.node_index, sign, 1.0)
+    cell = rule_cell(state, groups, proto, active)
+    if int(cell.sum()) != candidate.support:
+        # Equal scores and group membership must recover exactly the selected support.
+        raise AssertionError((int(cell.sum()), candidate.support, candidate))
+
+    rows = np.arange(len(labels))
+    direct_inner = np.sum(direction * (-probs), axis=1) + direction[rows, labels]
+    direct_moment = float(np.mean(np.where(cell, direct_inner, 0.0)))
+    if abs(direct_moment - candidate.signed_moment) > max(5e-9, 5e-7 * max(candidate.score, 1e-12)):
+        raise AssertionError((direct_moment, candidate.signed_moment, candidate))
+
+    old_brier = multiclass_brier(probs, labels)
+    onehot = np.eye(probs.shape[1], dtype=np.float64)[labels]
+    step = initial_step
+    for backtracks in range(max_backtracks + 1):
+        proposed = probs.copy()
+        update_cell = cell & active
+        if np.any(update_cell):
+            proposed[update_cell] = project_simplex_rows(probs[update_cell] + step * sign * direction[update_cell])
+        displacement = proposed - probs
+        linear = float(2.0 * np.mean(np.sum((probs - onehot) * displacement, axis=1)))
+        new_brier = multiclass_brier(proposed, labels)
+        if (
+            new_brier <= old_brier + c1 * linear + 1e-12
+            and new_brier <= old_brier + 1e-12
+            and linear < 1e-14
+        ):
+            rule = Rule(candidate.utility_rank, candidate.group, candidate.lower, candidate.upper, candidate.node_index, sign, float(step))
+            return proposed, rule, {
+                "old_brier": old_brier,
+                "new_brier": new_brier,
+                "linear_term": linear,
+                "backtracks": backtracks,
+                "step": float(step),
+                "direct_moment": direct_moment,
+            }
+        step *= shrink
+    return None, None, {
+        "old_brier": old_brier,
+        "new_brier": None,
+        "linear_term": None,
+        "backtracks": max_backtracks + 1,
+        "step": None,
+        "direct_moment": direct_moment,
+    }
+
+
+def fit_booster(
+    method: str,
+    correction_probs: np.ndarray,
+    correction_labels: np.ndarray,
+    validation_probs: np.ndarray,
+    validation_labels: np.ndarray,
+    correction_groups: Mapping[str, np.ndarray],
+    validation_groups: Mapping[str, np.ndarray],
+    tree: TaxonomyTree,
+    max_rounds: int = 100,
+    patience: int = 12,
+    epsilon: float = 1e-8,
+) -> Tuple[List[Rule], pd.DataFrame]:
+    current = ensure_probabilities(correction_probs).copy()
+    validation_current = ensure_probabilities(validation_probs).copy()
+    best_rules: List[Rule] = []
+    rules: List[Rule] = []
+    best_objective = evaluate_target(method, validation_current, validation_labels, validation_groups, tree)
+    initial_objective = best_objective
+    no_improvement = 0
+    history: List[Dict[str, Any]] = [{
+        "round": 0,
+        "validation_objective": best_objective,
+        "correction_objective": evaluate_target(method, current, correction_labels, correction_groups, tree),
+        "selected": False,
+        "best_so_far": True,
+    }]
+
+    for round_index in range(1, max_rounds + 1):
+        candidate, _ = find_candidate(method, current, correction_labels, correction_groups, tree)
+        if candidate.score <= epsilon:
+            history.append({"round": round_index, "stop_reason": "epsilon", "correction_objective": candidate.score})
+            break
+        proposed, rule, update_info = armijo_update(
+            current, correction_labels, correction_groups, tree, candidate,
+            initial_step=0.5, shrink=0.7, c1=1e-4, max_backtracks=100,
+        )
+        if proposed is None or rule is None:
+            history.append({
+                "round": round_index,
+                "stop_reason": "armijo_failed",
+                "correction_objective": candidate.score,
+                **update_info,
+            })
+            break
+        current = proposed
+        rules.append(rule)
+        validation_current = apply_rule(validation_current, validation_groups, tree, rule)
+        validation_objective = evaluate_target(method, validation_current, validation_labels, validation_groups, tree)
+        improved = validation_objective < best_objective - 1e-12
+        if improved:
+            best_objective = validation_objective
+            best_rules = list(rules)
+            no_improvement = 0
+        else:
+            no_improvement += 1
+        history.append({
+            "round": round_index,
+            "method": method,
+            "utility_rank": candidate.utility_rank,
+            "group": candidate.group,
+            "node_index": candidate.node_index,
+            "node_name": None if candidate.node_index is None else tree.nodes[candidate.node_index].path_key,
+            "lower": candidate.lower,
+            "upper": candidate.upper,
+            "support": candidate.support,
+            "signed_moment": candidate.signed_moment,
+            "correction_objective": candidate.score,
+            "validation_objective": validation_objective,
+            "best_so_far": improved,
+            **update_info,
+        })
+        if no_improvement >= patience:
+            history.append({"round": round_index, "stop_reason": "validation_patience"})
+            break
+    frame = pd.DataFrame(history)
+    frame.attrs["initial_validation_objective"] = initial_objective
+    frame.attrs["best_validation_objective"] = best_objective
+    frame.attrs["best_round"] = len(best_rules)
+    frame.attrs["rounds_run"] = len(rules)
+    return best_rules, frame
+
+
+def fit_temperature(probs: np.ndarray, labels: np.ndarray) -> float:
+    logp = np.log(np.maximum(ensure_probabilities(probs), 1e-300))
+    labels = np.asarray(labels, dtype=np.int64)
+
+    def objective(log_temperature: float) -> float:
+        temperature = float(np.exp(log_temperature))
+        q = stable_softmax(logp / temperature)
+        return multiclass_nll(q, labels)
+
+    result = minimize_scalar(objective, bounds=(-4.0, 4.0), method="bounded", options={"xatol": 1e-6})
+    if not result.success:
+        raise RuntimeError(f"temperature optimization failed: {result}")
+    return float(np.exp(result.x))
+
+
+def transform_temperature(probs: np.ndarray, temperature: float) -> np.ndarray:
+    return stable_softmax(np.log(np.maximum(ensure_probabilities(probs), 1e-300)) / temperature)
+
+
+@dataclass
+class DirichletState:
+    model: LogisticRegression
+    num_classes: int
+
+    def apply(self, probs: np.ndarray) -> np.ndarray:
+        logp = np.log(np.maximum(ensure_probabilities(probs), 1e-300))
+        q = self.model.predict_proba(logp)
+        result = np.full((len(q), self.num_classes), 1e-15, dtype=np.float64)
+        result[:, self.model.classes_.astype(int)] = q
+        return ensure_probabilities(result)
+
+
+def fit_dirichlet(probs: np.ndarray, labels: np.ndarray, seed: int) -> DirichletState:
+    probs = ensure_probabilities(probs)
+    labels = np.asarray(labels, dtype=np.int64)
