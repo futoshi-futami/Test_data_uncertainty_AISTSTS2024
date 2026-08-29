@@ -1,0 +1,123 @@
+name: HUC four real-data all14 from recovered project
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "HUC_ALL14_EXECUTION_TRIGGER.txt"
+      - "huc_runner_payload/**"
+      - ".github/workflows/huc-all14-payload.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: huc-four-real-all14-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  OMP_NUM_THREADS: "2"
+  MKL_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "2"
+  NUMEXPR_NUM_THREADS: "2"
+
+jobs:
+  run-data:
+    name: ${{ matrix.dataset }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: [slurp, nsl_kdd, nbaiot, inaturalist]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct and verify recovered project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat huc_runner_payload/payload.part.* | base64 --decode > "$RUNNER_TEMP/HUC_real_four_work.tar.xz"
+          echo "1095ec028d73c44f61dd81b3fcb138e7d184cbcfb0fd4c32f5a70eb6e009d99  $RUNNER_TEMP/HUC_real_four_work.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/huc_project"
+          tar -xJf "$RUNNER_TEMP/HUC_real_four_work.tar.xz" -C "$RUNNER_TEMP/huc_project"
+          test -f "$RUNNER_TEMP/huc_project/HUC_real_four_work/scripts/run_four_real.py"
+          cp huc_runner_payload/run_one.py "$RUNNER_TEMP/huc_project/run_one.py"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system packages for N-BaIoT
+        if: matrix.dataset == 'nbaiot'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
+      - name: Install Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT="$RUNNER_TEMP/huc_project/HUC_real_four_work"
+          python -m pip install --upgrade pip
+          python -m pip install -r "$PROJECT/requirements.txt"
+          if [ "${{ matrix.dataset }}" = "inaturalist" ]; then
+            python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          fi
+
+      - name: Test common Postprocessing code
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT="$RUNNER_TEMP/huc_project/HUC_real_four_work"
+          PYTHONPATH="$PROJECT/src" python -m pytest -q "$PROJECT/tests/test_core.py"
+
+      - name: Run ${{ matrix.dataset }} with the same 14 methods
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT="$RUNNER_TEMP/huc_project/HUC_real_four_work"
+          mkdir -p "$RUNNER_TEMP/huc_output/${{ matrix.dataset }}" "$RUNNER_TEMP/huc_cache/${{ matrix.dataset }}"
+          python "$RUNNER_TEMP/huc_project/run_one.py" \
+            --project "$PROJECT" \
+            --dataset "${{ matrix.dataset }}" \
+            --output "$RUNNER_TEMP/huc_output/${{ matrix.dataset }}" \
+            --cache "$RUNNER_TEMP/huc_cache/${{ matrix.dataset }}" \
+            2>&1 | tee "$RUNNER_TEMP/huc_output/${{ matrix.dataset }}/console.log"
+
+      - name: Show completion record
+        if: always()
+        shell: bash
+        run: |
+          find "$RUNNER_TEMP/huc_output/${{ matrix.dataset }}" -maxdepth 3 -type f -print | sort || true
+          cat "$RUNNER_TEMP/huc_output/${{ matrix.dataset }}/execution_status.json" || true
+          cat "$RUNNER_TEMP/huc_output/${{ matrix.dataset }}/completion.json" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: huc-all14-${{ matrix.dataset }}
+          path: ${{ runner.temp }}/huc_output/${{ matrix.dataset }}
+          if-no-files-found: warn
+          retention-days: 7
+
+  package:
+    name: package
+    needs: run-data
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: huc-all14-*
+          path: complete-real-four
+      - name: Record inventory
+        run: find complete-real-four -type f -print | sort | tee complete-real-four/ARTIFACT_INVENTORY.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huc-all14-complete
+          path: complete-real-four
+          retention-days: 7
