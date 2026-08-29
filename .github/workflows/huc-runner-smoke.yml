@@ -3,10 +3,13 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
 permissions:
   contents: read
 jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
+      - run: date -u
       - run: echo HUC_RUNNER_OK
