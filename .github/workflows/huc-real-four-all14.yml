@@ -1,0 +1,85 @@
+name: HUC four real-data experiments with unified 14 methods
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  OMP_NUM_THREADS: "2"
+  MKL_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "2"
+  NUMEXPR_NUM_THREADS: "2"
+
+jobs:
+  run-dataset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: [slurp, nsl_kdd, nbaiot, inaturalist]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install system packages
+        if: matrix.dataset == 'nbaiot'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unar p7zip-full
+      - name: Retrieve the fixed experiment implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p experiments/real_four
+          curl -fL --retry 5 --retry-all-errors 'https://raw.githubusercontent.com/futoshi-futami/Hierarchical-utility-calibration/real-four-experiments-20260827/experiments/real_four/aggregate.py?token=AESCCIWNZDIA7PM44QDUPITKSLEQVAA' -o experiments/real_four/aggregate.py
+          curl -fL --retry 5 --retry-all-errors 'https://raw.githubusercontent.com/futoshi-futami/Hierarchical-utility-calibration/real-four-experiments-20260827/experiments/real_four/execute.py?token=AESCCIQ6F773Q27RE7WFEITKSLEQVAA' -o experiments/real_four/execute.py
+          curl -fL --retry 5 --retry-all-errors 'https://raw.githubusercontent.com/futoshi-futami/Hierarchical-utility-calibration/real-four-experiments-20260827/experiments/real_four/huc_core.py?token=AESCCISDQB3ISCFPRQLJ4DDKSLEQVAA' -o experiments/real_four/huc_core.py
+          curl -fL --retry 5 --retry-all-errors 'https://raw.githubusercontent.com/futoshi-futami/Hierarchical-utility-calibration/real-four-experiments-20260827/experiments/real_four/requirements.txt?token=AESCCIXBHWKXQQ6C2UFG5VDKSLEQVAA' -o experiments/real_four/requirements.txt
+          curl -fL --retry 5 --retry-all-errors 'https://raw.githubusercontent.com/futoshi-futami/Hierarchical-utility-calibration/real-four-experiments-20260827/experiments/real_four/run_dataset.py?token=AESCCISQP2ATJHX6QN4RMQTKSLEQVAA' -o experiments/real_four/run_dataset.py
+          curl -fL --retry 5 --retry-all-errors 'https://raw.githubusercontent.com/futoshi-futami/Hierarchical-utility-calibration/real-four-experiments-20260827/experiments/real_four/test_core.py?token=AESCCIS2CAMJVZRM54ZZXA3KSLEQVAA' -o experiments/real_four/test_core.py
+          sha256sum experiments/real_four/*
+          python -m py_compile experiments/real_four/*.py
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r experiments/real_four/requirements.txt
+      - name: Install image packages
+        if: matrix.dataset == 'inaturalist'
+        run: python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      - name: Check common Postprocessing code
+        working-directory: experiments/real_four
+        run: python test_core.py | tee test_core.log
+      - name: Run one Data
+        working-directory: experiments/real_four
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXTRA=()
+          if [ '${{ matrix.dataset }}' = 'inaturalist' ]; then EXTRA+=(--images-per-species 100); fi
+          python execute.py \
+            --dataset '${{ matrix.dataset }}' \
+            --cache-dir '${{ runner.temp }}/huc-cache-${{ matrix.dataset }}' \
+            --output-dir 'results/${{ matrix.dataset }}' \
+            --seeds 20260819 20260820 20260821 20260822 20260823 \
+            --max-iter 25 \
+            "${EXTRA[@]}" \
+            2>&1 | tee 'results/${{ matrix.dataset }}.console.log'
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: huc-all14-${{ matrix.dataset }}
+          path: |
+            experiments/real_four/results/${{ matrix.dataset }}
+            experiments/real_four/results/${{ matrix.dataset }}.console.log
+            experiments/real_four/test_core.log
+          if-no-files-found: warn
+          retention-days: 30
